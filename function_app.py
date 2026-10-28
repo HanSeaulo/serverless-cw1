@@ -3,10 +3,10 @@ import datetime
 import json
 import logging
 import os
-from azure.data.tables import TableClient
 from azure.storage.queue import QueueClient
 from azure.core import MatchConditions
 from azure.core.exceptions import ResourceModifiedError, ResourceNotFoundError
+from azure.data.tables import TableClient, TableTransactionError
 
 logging.getLogger("azure").setLevel(logging.WARNING)
 
@@ -40,14 +40,21 @@ def get_rank(prp):
         return "Champion" 
 
 #
-def claim(p):
+def claim_all(players):
+    ops = []                                   
+    for e in players:
+        options = {
+            "etag": e.metadata["etag"],                         # the version we read earlier
+            "match_condition": MatchConditions.IfNotModified,   # only delete if it's still that version
+        }
+        operation = ("delete", e, options)     # what to do, which row, and the conditions
+        ops.append(operation)
+
     try:
-        waiting.delete_entity(p["PartitionKey"], p["RowKey"],
-                              etag=p.metadata["etag"],
-                              match_condition=MatchConditions.IfNotModified)
-        return True
-    except (ResourceModifiedError, ResourceNotFoundError):
-        return False   # already taken by another matchmaker
+        waiting.submit_transaction(ops)        # send all the deletes together as one transaction
+        return True                            # every delete succeeded, so all the players are ours
+    except TableTransactionError:
+        return False                           # at least one failed, so Azure deleted none of them
 
 # FUNCTION 1: GETS THE PLAYER AND PUTS THEM IN THE WAITING QUEUE
 @app.route(route="join", methods=["POST"], auth_level=func.AuthLevel.ANONYMOUS)
@@ -61,64 +68,56 @@ def join(req: func.HttpRequest) -> func.HttpResponse:
     p_rank = get_rank(p_rp)
     join_time = datetime.datetime.now(datetime.timezone.utc)
 
-    tempDict = {"PartitionKey": p_rank, "RowKey": str(p_id), "rp": p_rp, "joined_at": join_time}
+    tempDict = {"PartitionKey": "queue", "RowKey": str(p_id), "rank": p_rank, "rp": p_rp, "joined_at": join_time}
 
     waiting.upsert_entity(tempDict)
     checks.send_message(p_rank)
 
     return func.HttpResponse(f"{p_id} joined {p_rank} queue")
 
-# FUNCTION 2: USES THE WAITING QUEUE TO GET A PARTY OF 10 PLAYERS SO THAT A MATCH CAN BE STARTED
+# FUNCTION 2: USES THE WAITING TABLE TO GET A PARTY OF 10 PLAYERS SO THAT A MATCH CAN BE STARTED
 @app.queue_trigger(arg_name="msg", queue_name="check-tier", connection="AzureWebJobsStorage")
 def matchmaker(msg: func.QueueMessage):
     rank = msg.get_body().decode()
-    players = list(waiting.query_entities("PartitionKey eq @r", parameters={"r": rank}))
+
+    # 1. get this rank's players, oldest first   (CHANGED: filter on the rank column)
+    players = list(waiting.query_entities("PartitionKey eq 'queue' and rank eq @r", parameters={"r": rank}))
     players.sort(key=lambda p: p["joined_at"])
+
+    # 2. split into active and timed out
     active = []
     timed_out = []
     time_now = datetime.datetime.now(datetime.timezone.utc)
     for p in players:
-        j_time = p["joined_at"]
-        waited = (time_now - j_time).total_seconds()
+        waited = (time_now - p["joined_at"]).total_seconds()
         if waited > MAX_WAIT:
             timed_out.append(p)
         else:
             active.append(p)
 
-    #deleting all the timed out players
+    # 3. remove timed-out players   (CHANGED: claim_all with a list of one)
     for player in timed_out:
-        successful = claim(player)
-        if successful:
+        if claim_all([player]):
             logging.info(f"TIMEOUT {player['RowKey']} rank={rank}")
 
-    #trying to create a match
+    # 4. try to make a match from the oldest 10
     if len(active) >= 10:
-        match_list = []
-        #attempt to claim 10 players from the waiting queue
-        for player in active:
-            if claim(player):
-                match_list.append(player)
-            else:
-                break
-            if len(match_list) == 10:
-                break
-        if len(match_list) == 10:
-            #if we successfully claimed 10 players then they can queue for a match
+        match_list = active[:10]
+        if claim_all(match_list):
+            # we got all 10, so send the match   (CHANGED: rank comes from the rank column)
             match = []
             for player in match_list:
-                temp = {"player_id": player["RowKey"], "rp": player["rp"], "rank": player["PartitionKey"], "waited": (time_now - player["joined_at"]).total_seconds()}
+                temp = {"player_id": player["RowKey"], "rp": player["rp"], "rank": player["rank"],
+                        "waited": (time_now - player["joined_at"]).total_seconds()}
                 match.append(temp)
             matches_q.send_message(json.dumps(match))
             logging.info(f"MATCH rank={rank} players={len(match)}")
             if len(active) > 10:
                 checks.send_message(rank, visibility_timeout=RECHECK)
         else:
-            #if less than 10 players were claimed then put the players back in the waiting list
-            for player in match_list:
-                waiting.upsert_entity(player)
-            checks.send_message(rank, visibility_timeout=RECHECK)
-    else:
-        #look at other ranks?
-        if len(active) > 0:
+            # another matchmaker got them first, so check again shortly   (CHANGED: no put-back needed)
             checks.send_message(rank, visibility_timeout=RECHECK)
 
+    # 5. fewer than 10 waiting, so check again shortly
+    elif len(active) > 0:
+        checks.send_message(rank, visibility_timeout=RECHECK)
