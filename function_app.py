@@ -8,6 +8,8 @@ from azure.storage.queue import QueueClient
 from azure.core import MatchConditions
 from azure.core.exceptions import ResourceModifiedError, ResourceNotFoundError
 
+logging.getLogger("azure").setLevel(logging.WARNING)
+
 app = func.FunctionApp()
 
 # CONSTANTS 
@@ -96,6 +98,8 @@ def matchmaker(msg: func.QueueMessage):
         for player in active:
             if claim(player):
                 match_list.append(player)
+            else:
+                break
             if len(match_list) == 10:
                 break
         if len(match_list) == 10:
