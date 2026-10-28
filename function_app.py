@@ -16,7 +16,6 @@ app = func.FunctionApp()
 RECHECK = 2
 BORROW_AFTER = 5
 MAX_WAIT = 10
-RANKS = ["Bronze", "Silver", "Gold", "Platinum", "Diamond", "Champion"]
 
 # QUEUES
 conn = os.environ["AzureWebJobsStorage"]
@@ -41,83 +40,83 @@ def get_rank(prp):
 
 #
 def claim_all(players):
-    ops = []                                   
-    for e in players:
-        options = {
-            "etag": e.metadata["etag"],                         # the version we read earlier
-            "match_condition": MatchConditions.IfNotModified,   # only delete if it's still that version
-        }
-        operation = ("delete", e, options)     # what to do, which row, and the conditions
-        ops.append(operation)
+    ops = []
+    for p in players:
+        version_i_saw = p.metadata["etag"]     # the row's version stamp when we read it
+        conditions = {"etag": version_i_saw, "match_condition": MatchConditions.IfNotModified}
+        ops.append(("delete", p, conditions))  # delete p, only if unchanged
 
     try:
-        waiting.submit_transaction(ops)        # send all the deletes together as one transaction
-        return True                            # every delete succeeded, so all the players are ours
+        waiting.submit_transaction(ops)        # all deletes happen together, or none do
+        return True
     except TableTransactionError:
-        return False                           # at least one failed, so Azure deleted none of them
+        return False
+
 
 # FUNCTION 1: GETS THE PLAYER AND PUTS THEM IN THE WAITING QUEUE
+
 @app.route(route="join", methods=["POST"], auth_level=func.AuthLevel.ANONYMOUS)
 def join(req: func.HttpRequest) -> func.HttpResponse:
     body = req.get_json()          # {"player_id": ..., "rp": ...}
     
-    #ill write teh stuff here?
     p_id = body["player_id"]
     p_rp = int(body["rp"])
-    
-    p_rank = get_rank(p_rp)
     join_time = datetime.datetime.now(datetime.timezone.utc)
 
-    tempDict = {"PartitionKey": "queue", "RowKey": str(p_id), "rank": p_rank, "rp": p_rp, "joined_at": join_time}
+    tempDict = {"PartitionKey": "queue", "RowKey": str(p_id), "rp": p_rp, "joined_at": join_time}
 
     waiting.upsert_entity(tempDict)
-    checks.send_message(p_rank)
+    checks.send_message("check")
 
-    return func.HttpResponse(f"{p_id} joined {p_rank} queue")
+    return func.HttpResponse(f"{p_id} joined with {p_rp}RP\n")
 
-# FUNCTION 2: USES THE WAITING TABLE TO GET A PARTY OF 10 PLAYERS SO THAT A MATCH CAN BE STARTED
+
+def assign_band(prp, wait_time):
+    tier  = min( prp // 100, 5)     # 0=Bronze, 1=Silver, ..., 5=Champion
+    widen = int(wait_time // BORROW_AFTER)
+    low   = tier * 100 - (100*widen)
+    high  = tier * 100 + 99 + (100*widen)
+    if tier == 5:
+        high = 999999
+    return low, high
+    
+
+# FUNCTION 2: FINDS 10 PLAYERS WITH SIMILAR RP AND STARTS A MATCH
+
 @app.queue_trigger(arg_name="msg", queue_name="check-tier", connection="AzureWebJobsStorage")
 def matchmaker(msg: func.QueueMessage):
-    rank = msg.get_body().decode()
 
-    # 1. get this rank's players, oldest first   (CHANGED: filter on the rank column)
-    players = list(waiting.query_entities("PartitionKey eq 'queue' and rank eq @r", parameters={"r": rank}))
+    # get all waiting players, oldest first
+    players = list(waiting.query_entities("PartitionKey eq 'queue'"))
     players.sort(key=lambda p: p["joined_at"])
-
-    # 2. split into active and timed out
+    
+    # sort out the active and timed_out players
     active = []
     timed_out = []
     time_now = datetime.datetime.now(datetime.timezone.utc)
-    for p in players:
-        waited = (time_now - p["joined_at"]).total_seconds()
+    for player in players:
+        waited = (time_now - player["joined_at"]).total_seconds()
         if waited > MAX_WAIT:
-            timed_out.append(p)
+            timed_out.append(player)
         else:
-            active.append(p)
-
-    # 3. remove timed-out players   (CHANGED: claim_all with a list of one)
+            active.append(player)
+    #remove the timed_out players from queueing
     for player in timed_out:
         if claim_all([player]):
-            logging.info(f"TIMEOUT {player['RowKey']} rank={rank}")
+            logging.info(f"TIMEOUT {player['RowKey']}")
+    #try to start a match with the active players
+    for player in active:
+        waited = (time_now - player["joined_at"]).total_seconds()
+        low, high = assign_band(player["rp"], waited)
+    #      - find the active players whose rp is inside that band
+        in_band = []
+        for p2 in active:
+            if p2["rp"] >= low and p2["rp"] <= high:
+                in_band.append(p2)
+            if len(in_band) >= 10:
+                break
+    #      - if there are 10 or more: take the 10 oldest, claim_all them
+    #          - if the claim worked: send the match, log it, and stop (return)
+    #          - if it failed: someone else got them, so recheck and stop
 
-    # 4. try to make a match from the oldest 10
-    if len(active) >= 10:
-        match_list = active[:10]
-        if claim_all(match_list):
-            # we got all 10, so send the match   (CHANGED: rank comes from the rank column)
-            match = []
-            for player in match_list:
-                temp = {"player_id": player["RowKey"], "rp": player["rp"], "rank": player["rank"],
-                        "waited": (time_now - player["joined_at"]).total_seconds()}
-                match.append(temp)
-            matches_q.send_message(json.dumps(match))
-            logging.info(f"MATCH rank={rank} players={len(match)}")
-            if len(active) > 10:
-                checks.send_message(rank, visibility_timeout=RECHECK)
-        else:
-            # another matchmaker got them first, so check again shortly   (CHANGED: no put-back needed)
-            checks.send_message(rank, visibility_timeout=RECHECK)
-
-    # 5. fewer than 10 waiting, so check again shortly
-    elif len(active) > 0:
-        checks.send_message(rank, visibility_timeout=RECHECK)
+    # no band had 10 players: if anyone is still waiting, recheck
