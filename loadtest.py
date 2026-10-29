@@ -3,9 +3,10 @@ from concurrent.futures import ThreadPoolExecutor
 
 URL = "https://han-cw1-func-c7b4hrh4adddc0eb.francecentral-01.azurewebsites.net/api/join"
 N = int(sys.argv[1])
+RUN = int(time.time())
 
 def add_a_player(i):
-    body = {"player_id": f"run{N}-{i}", "rp": random.randint(0, 599)}
+    body = {"player_id": f"run{N}-{RUN}-{i}", "rp": random.randint(0, 599)}
     start = time.time()
     r = requests.post(URL, json=body)
     return time.time() - start, r.status_code == 200

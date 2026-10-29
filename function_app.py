@@ -17,7 +17,9 @@ app = func.FunctionApp()
 RECHECK = 5
 BORROW_AFTER = 15
 MAX_WAIT = 60
+
 RP_CHANGE = 25
+MATCH_TIME = 30
 REJOIN_WIN = 0.6
 REJOIN_LOSE = 0.4
 
@@ -126,7 +128,7 @@ def matchmaker(msg: func.QueueMessage):
                 for playerInMatch in in_band:
                     temp = {"player_id": playerInMatch["RowKey"], "rp": playerInMatch["rp"], "waited": (time_now - playerInMatch["joined_at"]).total_seconds()}
                     match.append(temp)
-                matches_q.send_message(json.dumps(match))
+                matches_q.send_message(json.dumps(match), visibility_timeout=MATCH_TIME)
                 logging.info(f"MATCH players={len(match)}")
                 if len(active) > 10:
                     checks.send_message("check", visibility_timeout=RECHECK)
