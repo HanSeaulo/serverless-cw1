@@ -13,7 +13,7 @@ def add_a_player(i):
 
 with ThreadPoolExecutor(max_workers=50) as pool:   # 50 requests in flight at once
     print(f"Start time: {datetime.datetime.now(datetime.timezone.utc).isoformat()}")
-    times = list(pool.map(add_a_player, range(N)))     # runs send_one for 0..N-1, collects the times
+    times = list(pool.map(add_a_player, range(N)))     # runs add_a_player for 0..N-1, collects the times
     print(f"End time: {datetime.datetime.now(datetime.timezone.utc).isoformat()}")
 
     duration = []
