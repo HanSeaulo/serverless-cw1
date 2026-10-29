@@ -30,43 +30,30 @@ checks  = QueueClient.from_connection_string(conn, "check-tier")
 matches_q = QueueClient.from_connection_string(conn, "matches-queue")
 matches_t = TableClient.from_connection_string(conn, table_name="matches")
 
-# GET THE RANK THAT CORRESPONDS TO EACH RP
-def get_rank(prp):
-    if prp < 100:
-        return "Bronze"
-    elif prp < 200:
-        return "Silver" 
-    elif prp < 300:
-        return "Gold" 
-    elif prp < 400:
-        return "Platinum" 
-    elif prp < 500:
-        return "Diamond"
-    else:
-        return "Champion" 
-
-#
+# function to make sure that all players are claimed together for a match
+# if even 1 of the 10 isnt claimable then the match cannot start
 def claim_all(players):
     ops = []
     for p in players:
-        version_i_saw = p.metadata["etag"]     # the row's version stamp when we read it
+        version_i_saw = p.metadata["etag"]     # the rows version stamp when we read it
         conditions = {"etag": version_i_saw, "match_condition": MatchConditions.IfNotModified}
-        ops.append(("delete", p, conditions))  # delete p, only if unchanged
+        ops.append(("delete", p, conditions))  # delete p only if unchanged
 
     try:
-        waiting.submit_transaction(ops)        # all deletes happen together, or none do
+        waiting.submit_transaction(ops)        # all deletes happen together or none do
         return True
     except TableTransactionError:
         return False
 
 
+# helper function to add a plyer to the waiting queue
 def add_to_queue(p_id, rp):
     join_time = datetime.datetime.now(datetime.timezone.utc)
     waiting.upsert_entity({"PartitionKey": "queue", "RowKey": str(p_id), "rp": rp, "joined_at": join_time})
     checks.send_message("check")
 
-# FUNCTION 1: GETS THE PLAYER AND PUTS THEM IN THE WAITING QUEUE
 
+# FUNCTION 1: GETS THE PLAYER AND PUTS THEM IN THE WAITING QUEUE
 @app.route(route="join", methods=["POST"], auth_level=func.AuthLevel.ANONYMOUS)
 def join(req: func.HttpRequest) -> func.HttpResponse:
     body = req.get_json()          # {"player_id": ..., "rp": ...}
@@ -79,6 +66,7 @@ def join(req: func.HttpRequest) -> func.HttpResponse:
     return func.HttpResponse(f"{p_id} joined with {p_rp}RP\n")
 
 
+# finding the range of rp for the match that will be created
 def assign_band(prp, wait_time):
     tier  = min( prp // 100, 5)     # 0=Bronze, 1=Silver, ..., 5=Champion
     widen = int(wait_time // BORROW_AFTER)
@@ -88,8 +76,8 @@ def assign_band(prp, wait_time):
         high = 999999
     return low, high
 
-# FUNCTION 2: FINDS 10 PLAYERS WITH SIMILAR RP AND STARTS A MATCH
 
+# FUNCTION 2: FINDS 10 PLAYERS WITH SIMILAR RP AND STARTS A MATCH
 @app.queue_trigger(arg_name="msg", queue_name="check-tier", connection="AzureWebJobsStorage")
 def matchmaker(msg: func.QueueMessage):
 
@@ -110,7 +98,7 @@ def matchmaker(msg: func.QueueMessage):
     #remove the timed_out players from queueing
     for player in timed_out:
         if claim_all([player]):
-            logging.info(f"TIMEOUT {player['RowKey']}")
+            logging.info(f"TIMEOUT {player['RowKey']} rp={player['rp']}")
     #try to start a match with the active players
     for player in active:
         waited = (time_now - player["joined_at"]).total_seconds()
@@ -134,6 +122,7 @@ def matchmaker(msg: func.QueueMessage):
                     checks.send_message("check", visibility_timeout=RECHECK)
                 return
             else:
+                logging.info("CLAIM_FAIL")
                 if len(active) > 10:
                     checks.send_message("check", visibility_timeout=RECHECK)
                 return
@@ -142,12 +131,14 @@ def matchmaker(msg: func.QueueMessage):
         checks.send_message("check", visibility_timeout=RECHECK)
 
 
+# these functions change the RP of the players and decide if they will play more games or quit
 def winning_team(players):
     for player in players:
         player["rp"] += RP_CHANGE
         if random.random() < REJOIN_WIN:
             add_to_queue(player["player_id"], player["rp"])
-
+        else:
+            logging.info(f"QUIT {player['player_id']} rp={player['rp']}")
 def losing_team(players):
     for player in players:
         player["rp"] -= RP_CHANGE
@@ -155,7 +146,11 @@ def losing_team(players):
             player["rp"] = 0
         if random.random() < REJOIN_LOSE:
             add_to_queue(player["player_id"], player["rp"])
+        else:
+            logging.info(f"QUIT {player['player_id']} rp={player['rp']}")
 
+# FUNCTION 3: the 10 players in a match play against one another
+#winning and losing teams are decided
 @app.queue_trigger(arg_name="msg", queue_name="matches-queue", connection="AzureWebJobsStorage")
 def match_resolver(msg: func.QueueMessage):
     players = json.loads(msg.get_body().decode())   # back into a list of dicts
