@@ -8,16 +8,15 @@ import azure.functions as func
 from azure.core import MatchConditions
 from azure.storage.queue import QueueClient
 from azure.data.tables import TableClient, TableTransactionError
-from azure.core.exceptions import ResourceModifiedError, ResourceNotFoundError
 
 logging.getLogger("azure").setLevel(logging.WARNING)
 
 app = func.FunctionApp()
 
 # CONSTANTS 
-RECHECK = 2
-BORROW_AFTER = 5
-MAX_WAIT = 10
+RECHECK = 5
+BORROW_AFTER = 15
+MAX_WAIT = 60
 RP_CHANGE = 25
 REJOIN_WIN = 0.6
 REJOIN_LOSE = 0.4
