@@ -1,12 +1,14 @@
-import azure.functions as func
-import datetime
-import json
-import logging
 import os
-from azure.storage.queue import QueueClient
+import uuid 
+import json
+import random
+import logging
+import datetime
+import azure.functions as func
 from azure.core import MatchConditions
-from azure.core.exceptions import ResourceModifiedError, ResourceNotFoundError
+from azure.storage.queue import QueueClient
 from azure.data.tables import TableClient, TableTransactionError
+from azure.core.exceptions import ResourceModifiedError, ResourceNotFoundError
 
 logging.getLogger("azure").setLevel(logging.WARNING)
 
@@ -16,12 +18,16 @@ app = func.FunctionApp()
 RECHECK = 2
 BORROW_AFTER = 5
 MAX_WAIT = 10
+RP_CHANGE = 25
+REJOIN_WIN = 0.6
+REJOIN_LOSE = 0.4
 
-# QUEUES
+# QUEUES and TABLES
 conn = os.environ["AzureWebJobsStorage"]
 waiting = TableClient.from_connection_string(conn, table_name="waiting")
 checks  = QueueClient.from_connection_string(conn, "check-tier")
 matches_q = QueueClient.from_connection_string(conn, "matches-queue")
+matches_t = TableClient.from_connection_string(conn, table_name="matches")
 
 # GET THE RANK THAT CORRESPONDS TO EACH RP
 def get_rank(prp):
@@ -53,6 +59,11 @@ def claim_all(players):
         return False
 
 
+def add_to_queue(p_id, rp):
+    join_time = datetime.datetime.now(datetime.timezone.utc)
+    waiting.upsert_entity({"PartitionKey": "queue", "RowKey": str(p_id), "rp": rp, "joined_at": join_time})
+    checks.send_message("check")
+
 # FUNCTION 1: GETS THE PLAYER AND PUTS THEM IN THE WAITING QUEUE
 
 @app.route(route="join", methods=["POST"], auth_level=func.AuthLevel.ANONYMOUS)
@@ -61,12 +72,8 @@ def join(req: func.HttpRequest) -> func.HttpResponse:
     
     p_id = body["player_id"]
     p_rp = int(body["rp"])
-    join_time = datetime.datetime.now(datetime.timezone.utc)
 
-    tempDict = {"PartitionKey": "queue", "RowKey": str(p_id), "rp": p_rp, "joined_at": join_time}
-
-    waiting.upsert_entity(tempDict)
-    checks.send_message("check")
+    add_to_queue(p_id, p_rp)
 
     return func.HttpResponse(f"{p_id} joined with {p_rp}RP\n")
 
@@ -132,3 +139,59 @@ def matchmaker(msg: func.QueueMessage):
 
     if len(active) > 0:
         checks.send_message("check", visibility_timeout=RECHECK)
+
+
+def winning_team(players):
+    for player in players:
+        player["rp"] += RP_CHANGE
+        if random.random() < REJOIN_WIN:
+            add_to_queue(player["player_id"], player["rp"])
+
+def losing_team(players):
+    for player in players:
+        player["rp"] -= RP_CHANGE
+        if player["rp"] < 0:
+            player["rp"] = 0
+        if random.random() < REJOIN_LOSE:
+            add_to_queue(player["player_id"], player["rp"])
+
+@app.queue_trigger(arg_name="msg", queue_name="matches-queue", connection="AzureWebJobsStorage")
+def match_resolver(msg: func.QueueMessage):
+    players = json.loads(msg.get_body().decode())   # back into a list of dicts
+
+    #the match is teama vs teamb, players 0-4 vs 5-9, first find avg rp of each team
+    avg_a = 0.00
+    avg_b = 0.00
+    for i in range(10):
+        if i<5:
+            avg_a += players[i]["rp"]
+        else:
+            avg_b += players[i]["rp"]
+    avg_a /= 5
+    avg_b /= 5
+
+    #find the winning team
+    chance_a = 0.5 + (avg_a - avg_b) / 1000
+    team_a_wins = random.random() < chance_a
+
+    #before the rp is updated and players rejoin or quit, we find the stats
+    #create a record in the table for the match that was just played
+    rps = []
+    for p in players:
+        rps.append(p["rp"])
+    waits = []
+    for p in players:
+        waits.append(p["waited"])
+    matches_t.create_entity({"PartitionKey": "match", "RowKey": str(uuid.uuid4()), "avg_a": avg_a, "avg_b": avg_b,
+    "rp_spread": max(rps) - min(rps),        # match quality: smaller = fairer
+    "avg_wait": sum(waits) / len(waits),     # how long players queued
+    "max_wait": max(waits), "winner": "A" if team_a_wins else "B", "resolved_at": datetime.datetime.now(datetime.timezone.utc), })
+    logging.info(f"RESOLVED winner={'A' if team_a_wins else 'B'} spread={max(rps) - min(rps)}")
+
+    #now these functions can be called depending on which team won, so the players can either quit or rejoin the matchmaking
+    if team_a_wins:
+        winning_team(players[0:5])
+        losing_team(players[5:10])
+    else:
+        losing_team(players[0:5])
+        winning_team(players[5:10])
