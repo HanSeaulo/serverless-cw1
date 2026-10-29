@@ -79,7 +79,6 @@ def assign_band(prp, wait_time):
     if tier == 5:
         high = 999999
     return low, high
-    
 
 # FUNCTION 2: FINDS 10 PLAYERS WITH SIMILAR RP AND STARTS A MATCH
 
@@ -108,15 +107,28 @@ def matchmaker(msg: func.QueueMessage):
     for player in active:
         waited = (time_now - player["joined_at"]).total_seconds()
         low, high = assign_band(player["rp"], waited)
-    #      - find the active players whose rp is inside that band
+    #find the active players whose rp is inside that band
         in_band = []
         for p2 in active:
             if p2["rp"] >= low and p2["rp"] <= high:
                 in_band.append(p2)
             if len(in_band) >= 10:
                 break
-    #      - if there are 10 or more: take the 10 oldest, claim_all them
-    #          - if the claim worked: send the match, log it, and stop (return)
-    #          - if it failed: someone else got them, so recheck and stop
+        if len(in_band) == 10:
+            if claim_all(in_band):
+                match = []
+                for playerInMatch in in_band:
+                    temp = {"player_id": playerInMatch["RowKey"], "rp": playerInMatch["rp"], "waited": (time_now - playerInMatch["joined_at"]).total_seconds()}
+                    match.append(temp)
+                matches_q.send_message(json.dumps(match))
+                logging.info(f"MATCH players={len(match)}")
+                if len(active) > 10:
+                    checks.send_message("check", visibility_timeout=RECHECK)
+                return
+            else:
+                if len(active) > 10:
+                    checks.send_message("check", visibility_timeout=RECHECK)
+                return
 
-    # no band had 10 players: if anyone is still waiting, recheck
+    if len(active) > 0:
+        checks.send_message("check", visibility_timeout=RECHECK)
